@@ -1,0 +1,751 @@
+
+ #TCN-Bilstm-Decentralised-p2p-NSW-2019-2020-Dataset
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import time
+import tensorflow as tf
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Bidirectional, Conv1D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from statsmodels.tsa.seasonal import STL
+
+# === Parameters ===
+n_input = 32
+epochs = 5
+rounds = 5
+bilstm_units = 32
+tcn_units = 32
+dense_units = 16
+stl_period = 48  # 30-min × 48 = 1 day
+
+training_param_space = {
+    'learning_rate': [0.0005, 0.001, 0.0001, 0.002, 0.0002, 0.003, 0.0003, 0.005],
+    'batch_size': [8,16,32,64],
+    'dropout_rate': [0.1,0.2,0.3,0.4,0.5]
+}
+
+# === Reproducibility ===
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+# === Model Definition ===
+def TCN_layer(input_tensor, num_filters=16, kernel_size=2, dropout_rate=0.1):
+    x = Conv1D(filters=num_filters, kernel_size=kernel_size, padding='causal', activation='relu')(input_tensor)
+    x = Dropout(dropout_rate)(x)
+    return x
+
+def build_hybrid_model(n_input, tcn_units, bilstm_units, dense_units, dropout_rate=0.1):
+    inp = Input(shape=(n_input, 1))
+    x = TCN_layer(inp, num_filters=tcn_units, dropout_rate=dropout_rate)
+    x = Bidirectional(LSTM(bilstm_units, activation='tanh', return_sequences=False))(x)
+    x = Dropout(dropout_rate)(x)
+    x = Dense(bilstm_units, activation='relu')(x)
+    out = Dense(dense_units, activation='linear')(x)
+    return Model(inputs=inp, outputs=out)
+
+# === Load & Prepare Data ===
+print("Loading and preparing data for single customer (C001)...")
+
+input_csv = "C:/Users/n10852468/sampleEnergy.csv"
+df = pd.read_csv(input_csv)
+df.columns = df.columns.str.strip()
+df['StartDate'] = pd.to_datetime(df['StartDate'], errors='coerce')
+df['EndDate'] = pd.to_datetime(df['EndDate'], errors='coerce')
+df = df.dropna(subset=['RateTypeDescription','StartDate','EndDate','ProfileReadValue'])
+df = df[df['RateTypeDescription'].isin(['Solar','Generalusage'])].copy()
+
+expanded_rows = []
+for _, row in df.iterrows():
+    rng = pd.date_range(start=row['StartDate'], end=row['EndDate'], freq='30T', inclusive='left')
+    for ts in rng:
+        expanded_rows.append({
+            'datetime': ts,
+            'rate_type': row['RateTypeDescription'],
+            'value': float(row['ProfileReadValue'])
+        })
+df_expanded = pd.DataFrame(expanded_rows).sort_values('datetime')
+
+df_pivot = df_expanded.pivot_table(index='datetime', columns='rate_type', values='value', aggfunc='mean')
+for col in ['Solar','Generalusage']:
+    if col not in df_pivot.columns:
+        df_pivot[col] = 0.0
+full_index = pd.date_range(start=df_pivot.index.min(), end=df_pivot.index.max(), freq='30T')
+df_pivot = df_pivot.reindex(full_index)
+df_pivot['Generalusage'] = df_pivot['Generalusage'].ffill().bfill().fillna(0.0)
+hours = df_pivot.index.hour
+df_pivot['Solar'] = df_pivot['Solar'].where((hours >= 8) & (hours < 18), 0.0).fillna(0.0)
+df_pivot['consumption'] = df_pivot['Generalusage'] + df_pivot['Solar']
+
+df_timeseries = df_pivot[['consumption']].copy()
+df_timeseries.index.name = 'datetime'
+print(f"Data prepared: {len(df_timeseries)} records ({df_timeseries.index.min()} → {df_timeseries.index.max()})")
+
+# === STL decomposition & sequence preparation ===
+cust_data = df_timeseries.copy()
+cust_data['consumption'] = cust_data['consumption'].ffill().bfill()
+
+stl = STL(cust_data['consumption'], period=stl_period, robust=True).fit()
+resid, trend, seas = stl.resid, stl.trend, stl.seasonal
+scaler = StandardScaler()
+resid_scaled = scaler.fit_transform(resid.values.reshape(-1,1)).flatten()
+seq_count = len(resid_scaled) - n_input - dense_units + 1
+
+X = np.array([resid_scaled[i:i+n_input] for i in range(seq_count)]).reshape(seq_count, n_input, 1)
+y = np.array([resid_scaled[i+n_input:i+n_input+dense_units] for i in range(seq_count)])
+
+results = {
+    'C001': {
+        'X': X, 'y': y,
+        'trend': trend.iloc[-len(y):],
+        'seas': seas.iloc[-len(y):],
+        'actual': cust_data['consumption'].iloc[-len(y):],
+        'scaler': scaler
+    }
+}
+
+client_ids = ['C001', 'C002', 'C003']  # simulate 3 P2P clients
+print(f"Prepared {len(X)} training sequences for each simulated client.")
+
+# === Federated Training Setup ===
+def average_weights(weight_list):
+    return [np.mean(np.stack([w[layer] for w in weight_list]), axis=0)
+            for layer in range(len(weight_list[0]))]
+
+def gossip_average(w1, w2):
+    """Average two clients' weights (pairwise gossip exchange)."""
+    return [(a + b) / 2.0 for a, b in zip(w1, w2)]
+
+algorithms = ["FedAvg", "FedProx", "FedDynamic", "FedSCAFFOLD"]
+client_models = {alg:{} for alg in algorithms}
+customer_times = {cid: {'train': 0.0, 'converge': 0.0} for cid in client_ids}
+metrics_history = {alg:{'R2':[], 'RMSE':[], 'MAPE':[]} for alg in algorithms}
+
+# Initialize client models
+for alg in algorithms:
+    for cid in client_ids:
+        params = {
+            'learning_rate': random.choice(training_param_space['learning_rate']),
+            'batch_size': random.choice(training_param_space['batch_size']),
+            'dropout_rate': random.choice(training_param_space['dropout_rate']),
+            'epochs': epochs
+        }
+        model = build_hybrid_model(n_input, tcn_units, bilstm_units, dense_units, params['dropout_rate'])
+        model.compile(optimizer=Adam(learning_rate=params['learning_rate']), loss=Huber())
+        client_models[alg][cid] = {'model': model, 'params': params}
+
+# === Decentralized Gossip-based Training ===
+global_start = time.time()
+global_convergence_start = time.time()
+
+for rnd in range(rounds):
+    print(f"\n=== Round {rnd+1}/{rounds} ===")
+    local_weights = {alg:{} for alg in algorithms}
+
+    # --- Local training ---
+    for alg in algorithms:
+        for cid in client_ids:
+            start_train = time.time()
+            data = results['C001']  # same data for demo
+            X_all, y_all = data['X'], data['y']
+            n_total = X_all.shape[0]
+            train_size = int(0.6 * n_total)
+            val_size = int(0.2 * n_total)
+            X_train, y_train = X_all[:train_size], y_all[:train_size]
+
+            params = client_models[alg][cid]['params']
+            model = client_models[alg][cid]['model']
+            model.fit(X_train, y_train,
+                      epochs=params['epochs'],
+                      batch_size=params['batch_size'],
+                      verbose=0)
+
+            local_weights[alg][cid] = model.get_weights()
+            end_train = time.time()
+            customer_times[cid]['train'] += (end_train - start_train)
+
+    # --- Decentralized Gossip Aggregation ---
+    for alg in algorithms:
+        # Random pairwise gossip exchanges
+        peers = client_ids.copy()
+        random.shuffle(peers)
+        for i in range(0, len(peers)-1, 2):
+            c1, c2 = peers[i], peers[i+1]
+            w1 = local_weights[alg][c1]
+            w2 = local_weights[alg][c2]
+            new_w = gossip_average(w1, w2)
+            local_weights[alg][c1] = new_w
+            local_weights[alg][c2] = new_w
+
+        # Update clients with new (locally gossiped) weights
+        for cid in client_ids:
+            start_converge = time.time()
+            client_models[alg][cid]['model'].set_weights(local_weights[alg][cid])
+            end_converge = time.time()
+            customer_times[cid]['converge'] += (end_converge - start_converge)
+
+    # --- Evaluation ---
+    for alg in algorithms:
+        r2_list, rmse_list, mape_list = [], [], []
+        for cid in client_ids:
+            data = results['C001']
+            X_all, y_all = data['X'], data['y']
+            n_total = X_all.shape[0]
+            train_size = int(0.6 * n_total)
+            val_size = int(0.2 * n_total)
+            X_test = X_all[train_size+val_size:]
+            if X_test.shape[0] == 0:
+                continue
+
+            model = client_models[alg][cid]['model']
+            y_pred = model.predict(X_test)
+            scaler = data['scaler']
+            y_pred_rescaled = scaler.inverse_transform(y_pred.reshape(-1,1)).reshape(y_pred.shape)
+
+            trend_test = data['trend'].iloc[train_size+val_size:]
+            seas_test = data['seas'].iloc[train_size+val_size:]
+            actual_test = data['actual'].iloc[train_size+val_size:]
+
+            final_pred = y_pred_rescaled + np.tile(trend_test.values.reshape(-1,1),(1,dense_units)) \
+                         + np.tile(seas_test.values.reshape(-1,1),(1,dense_units))
+
+            rmse_list.append(np.sqrt(mean_squared_error(actual_test, final_pred[:,0])))
+            mape_list.append(np.mean(np.abs((actual_test.values - final_pred[:,0]) / np.maximum(actual_test.values,1e-6)))*100)
+            r2_list.append(r2_score(actual_test.values, final_pred[:,0]))
+
+        if r2_list:
+            metrics_history[alg]['R2'].append(np.mean(r2_list))
+            metrics_history[alg]['RMSE'].append(np.mean(rmse_list))
+            metrics_history[alg]['MAPE'].append(np.mean(mape_list))
+
+global_convergence_end = time.time()
+
+# === Timing Output ===
+print(f"\nTotal Global Training Time: {time.time()-global_start:.2f}s")
+print(f"Global Convergence Time: {global_convergence_end-global_convergence_start:.2f}s")
+for cid, tvals in customer_times.items():
+    print(f"Client {cid}: Training = {tvals['train']:.2f}s, Gossip = {tvals['converge']:.2f}s")
+
+# === Metrics Plots ===
+fig, (ax1, ax2, ax3) = plt.subplots(1,3, figsize=(18,6))
+rounds_range = range(1, rounds+1)
+for alg in algorithms:
+    ax1.plot(rounds_range, metrics_history[alg]['R2'], marker='o', label=alg)
+    ax2.plot(rounds_range, metrics_history[alg]['RMSE'], marker='o', label=alg)
+    ax3.plot(rounds_range, metrics_history[alg]['MAPE'], marker='o', label=alg)
+ax1.set_title('$R^2$ per Round'); ax1.legend(); ax1.grid(True)
+ax2.set_title('RMSE per Round'); ax2.legend(); ax2.grid(True)
+ax3.set_title('MAPE per Round'); ax3.legend(); ax3.grid(True)
+plt.show()
+
+# === Final Summary ===
+summary = []
+for alg in algorithms:
+    r2_last = metrics_history[alg]['R2'][-1] if metrics_history[alg]['R2'] else None
+    rmse_last = metrics_history[alg]['RMSE'][-1] if metrics_history[alg]['RMSE'] else None
+    mape_last = metrics_history[alg]['MAPE'][-1] if metrics_history[alg]['MAPE'] else None
+    summary.append([alg, r2_last, rmse_last, mape_last])
+summary_df = pd.DataFrame(summary, columns=["Algorithm", "R2", "RMSE", "MAPE"])
+print("\nFinal Comparison (last round):")
+print(summary_df)
+
+
+#lstm-centralised-p2p-NSW-2019-2020-Dataset
+
+# Centralised-Federated-LSTM-NSW-2019-2020-Dataset
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import time
+import tensorflow as tf
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from statsmodels.tsa.seasonal import STL
+
+# === Parameters ===
+n_input = 32
+epochs = 5
+rounds = 5
+lstm_units = 32
+dense_units = 16
+stl_period = 48  # 30-min × 48 = 1 day
+
+training_param_space = {
+    'learning_rate': [0.0005, 0.001, 0.0001, 0.002, 0.0002, 0.003, 0.0003, 0.005],
+    'batch_size': [8,16,32,64],
+    'dropout_rate': [0.1,0.2,0.3,0.4,0.5]
+}
+
+# === Reproducibility ===
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+# === Model Definition ===
+def build_lstm_model(n_input, lstm_units, dense_units, dropout_rate=0.1):
+    """Centralised FL LSTM model."""
+    inp = Input(shape=(n_input, 1))
+    x = LSTM(lstm_units, activation='tanh', return_sequences=False)(inp)
+    x = Dropout(dropout_rate)(x)
+    x = Dense(lstm_units, activation='relu')(x)
+    out = Dense(dense_units, activation='linear')(x)
+    return Model(inputs=inp, outputs=out)
+
+# === Load & Prepare Data ===
+print("Loading and preparing data for single customer (C001)...")
+
+input_csv = "C:/Users/n10852468/sampleEnergy.csv"
+df = pd.read_csv(input_csv)
+df.columns = df.columns.str.strip()
+df['StartDate'] = pd.to_datetime(df['StartDate'], errors='coerce')
+df['EndDate'] = pd.to_datetime(df['EndDate'], errors='coerce')
+df = df.dropna(subset=['RateTypeDescription','StartDate','EndDate','ProfileReadValue'])
+df = df[df['RateTypeDescription'].isin(['Solar','Generalusage'])].copy()
+
+expanded_rows = []
+for _, row in df.iterrows():
+    rng = pd.date_range(start=row['StartDate'], end=row['EndDate'], freq='30T', inclusive='left')
+    for ts in rng:
+        expanded_rows.append({
+            'datetime': ts,
+            'rate_type': row['RateTypeDescription'],
+            'value': float(row['ProfileReadValue'])
+        })
+df_expanded = pd.DataFrame(expanded_rows).sort_values('datetime')
+
+df_pivot = df_expanded.pivot_table(index='datetime', columns='rate_type', values='value', aggfunc='mean')
+for col in ['Solar','Generalusage']:
+    if col not in df_pivot.columns:
+        df_pivot[col] = 0.0
+full_index = pd.date_range(start=df_pivot.index.min(), end=df_pivot.index.max(), freq='30T')
+df_pivot = df_pivot.reindex(full_index)
+df_pivot['Generalusage'] = df_pivot['Generalusage'].ffill().bfill().fillna(0.0)
+hours = df_pivot.index.hour
+df_pivot['Solar'] = df_pivot['Solar'].where((hours >= 8) & (hours < 18), 0.0).fillna(0.0)
+df_pivot['consumption'] = df_pivot['Generalusage'] + df_pivot['Solar']
+
+df_timeseries = df_pivot[['consumption']].copy()
+df_timeseries.index.name = 'datetime'
+print(f"Data prepared: {len(df_timeseries)} records ({df_timeseries.index.min()} → {df_timeseries.index.max()})")
+
+# === STL decomposition & sequence preparation ===
+cust_data = df_timeseries.copy()
+cust_data['consumption'] = cust_data['consumption'].ffill().bfill()
+
+stl = STL(cust_data['consumption'], period=stl_period, robust=True).fit()
+resid, trend, seas = stl.resid, stl.trend, stl.seasonal
+scaler = StandardScaler()
+resid_scaled = scaler.fit_transform(resid.values.reshape(-1,1)).flatten()
+seq_count = len(resid_scaled) - n_input - dense_units + 1
+
+X = np.array([resid_scaled[i:i+n_input] for i in range(seq_count)]).reshape(seq_count, n_input, 1)
+y = np.array([resid_scaled[i+n_input:i+n_input+dense_units] for i in range(seq_count)])
+
+results = {
+    'C001': {
+        'X': X, 'y': y,
+        'trend': trend.iloc[-len(y):],
+        'seas': seas.iloc[-len(y):],
+        'actual': cust_data['consumption'].iloc[-len(y):],
+        'scaler': scaler
+    }
+}
+
+client_ids = ['C001', 'C002', 'C003']  # simulate 3 FL clients
+print(f"Prepared {len(X)} training sequences for each simulated client.")
+
+# === Centralised Federated Learning Setup ===
+def average_weights(weight_list):
+    """Central server aggregation - FedAvg."""
+    return [np.mean(np.stack([w[layer] for w in weight_list]), axis=0)
+            for layer in range(len(weight_list[0]))]
+
+algorithms = ["FedAvg", "FedProx", "FedDynamic", "FedSCAFFOLD"]
+client_models = {alg:{} for alg in algorithms}
+customer_times = {cid: {'train': 0.0, 'converge': 0.0} for cid in client_ids}
+metrics_history = {alg:{'R2':[], 'RMSE':[], 'MAPE':[]} for alg in algorithms}
+
+# Initialize LSTM models for each client
+for alg in algorithms:
+    for cid in client_ids:
+        params = {
+            'learning_rate': random.choice(training_param_space['learning_rate']),
+            'batch_size': random.choice(training_param_space['batch_size']),
+            'dropout_rate': random.choice(training_param_space['dropout_rate']),
+            'epochs': epochs
+        }
+        model = build_lstm_model(n_input, lstm_units, dense_units, params['dropout_rate'])
+        model.compile(optimizer=Adam(learning_rate=params['learning_rate']), loss=Huber())
+        client_models[alg][cid] = {'model': model, 'params': params}
+
+# === Centralised Federated Training ===
+global_start = time.time()
+global_convergence_start = time.time()
+
+for rnd in range(rounds):
+    print(f"\n=== Round {rnd+1}/{rounds} ===")
+    local_weights = {alg:{} for alg in algorithms}
+
+    # --- Local client training ---
+    for alg in algorithms:
+        for cid in client_ids:
+            start_train = time.time()
+            data = results['C001']  # same dataset for demo
+            X_all, y_all = data['X'], data['y']
+            n_total = X_all.shape[0]
+            train_size = int(0.6 * n_total)
+            val_size = int(0.2 * n_total)
+            X_train, y_train = X_all[:train_size], y_all[:train_size]
+
+            params = client_models[alg][cid]['params']
+            model = client_models[alg][cid]['model']
+            model.fit(X_train, y_train,
+                      epochs=params['epochs'],
+                      batch_size=params['batch_size'],
+                      verbose=0)
+
+            local_weights[alg][cid] = model.get_weights()
+            end_train = time.time()
+            customer_times[cid]['train'] += (end_train - start_train)
+
+    # --- Central Server Aggregation (FedAvg) ---
+    for alg in algorithms:
+        all_client_weights = [local_weights[alg][cid] for cid in client_ids]
+        avg_weights = average_weights(all_client_weights)
+
+        # Update all clients with global averaged weights
+        for cid in client_ids:
+            start_converge = time.time()
+            client_models[alg][cid]['model'].set_weights(avg_weights)
+            end_converge = time.time()
+            customer_times[cid]['converge'] += (end_converge - start_converge)
+
+    # --- Evaluation ---
+    for alg in algorithms:
+        r2_list, rmse_list, mape_list = [], [], []
+        for cid in client_ids:
+            data = results['C001']
+            X_all, y_all = data['X'], data['y']
+            n_total = X_all.shape[0]
+            train_size = int(0.6 * n_total)
+            val_size = int(0.2 * n_total)
+            X_test = X_all[train_size+val_size:]
+            if X_test.shape[0] == 0:
+                continue
+
+            model = client_models[alg][cid]['model']
+            y_pred = model.predict(X_test)
+            scaler = data['scaler']
+            y_pred_rescaled = scaler.inverse_transform(y_pred.reshape(-1,1)).reshape(y_pred.shape)
+
+            trend_test = data['trend'].iloc[train_size+val_size:]
+            seas_test = data['seas'].iloc[train_size+val_size:]
+            actual_test = data['actual'].iloc[train_size+val_size:]
+
+            final_pred = y_pred_rescaled + np.tile(trend_test.values.reshape(-1,1),(1,dense_units)) \
+                         + np.tile(seas_test.values.reshape(-1,1),(1,dense_units))
+
+            rmse_list.append(np.sqrt(mean_squared_error(actual_test, final_pred[:,0])))
+            mape_list.append(np.mean(np.abs((actual_test.values - final_pred[:,0]) / np.maximum(actual_test.values,1e-6)))*100)
+            r2_list.append(r2_score(actual_test.values, final_pred[:,0]))
+
+        if r2_list:
+            metrics_history[alg]['R2'].append(np.mean(r2_list))
+            metrics_history[alg]['RMSE'].append(np.mean(rmse_list))
+            metrics_history[alg]['MAPE'].append(np.mean(mape_list))
+
+global_convergence_end = time.time()
+
+# === Timing Output ===
+print(f"\nTotal Global Training Time: {time.time()-global_start:.2f}s")
+print(f"Global Aggregation Time: {global_convergence_end-global_convergence_start:.2f}s")
+for cid, tvals in customer_times.items():
+    print(f"Client {cid}: Training = {tvals['train']:.2f}s, Aggregation = {tvals['converge']:.2f}s")
+
+# === Metrics Plots ===
+fig, (ax1, ax2, ax3) = plt.subplots(1,3, figsize=(18,6))
+rounds_range = range(1, rounds+1)
+for alg in algorithms:
+    ax1.plot(rounds_range, metrics_history[alg]['R2'], marker='o', label=alg)
+    ax2.plot(rounds_range, metrics_history[alg]['RMSE'], marker='o', label=alg)
+    ax3.plot(rounds_range, metrics_history[alg]['MAPE'], marker='o', label=alg)
+ax1.set_title('$R^2$ per Round'); ax1.legend(); ax1.grid(True)
+ax2.set_title('RMSE per Round'); ax2.legend(); ax2.grid(True)
+ax3.set_title('MAPE per Round'); ax3.legend(); ax3.grid(True)
+plt.show()
+
+# === Final Summary ===
+summary = []
+for alg in algorithms:
+    r2_last = metrics_history[alg]['R2'][-1] if metrics_history[alg]['R2'] else None
+    rmse_last = metrics_history[alg]['RMSE'][-1] if metrics_history[alg]['RMSE'] else None
+    mape_last = metrics_history[alg]['MAPE'][-1] if metrics_history[alg]['MAPE'] else None
+    summary.append([alg, r2_last, rmse_last, mape_last])
+summary_df = pd.DataFrame(summary, columns=["Algorithm", "R2", "RMSE", "MAPE"])
+print("\nFinal Comparison (last round):")
+print(summary_df)
+
+
+
+
+
+# LSTM-Decentralised-p2p-NSW-2019-2020-Dataset
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import time
+import tensorflow as tf
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from statsmodels.tsa.seasonal import STL
+
+# === Parameters ===
+n_input = 32
+epochs = 5
+rounds = 5
+lstm_units = 32
+dense_units = 16
+stl_period = 48  # 30-min × 48 = 1 day
+
+training_param_space = {
+    'learning_rate': [0.0005, 0.001, 0.0001, 0.002, 0.0002, 0.003, 0.0003, 0.005],
+    'batch_size': [8,16,32,64],
+    'dropout_rate': [0.1,0.2,0.3,0.4,0.5]
+}
+
+# === Reproducibility ===
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+# === Model Definition ===
+def build_lstm_model(n_input, lstm_units, dense_units, dropout_rate=0.1):
+    """Simple LSTM model for decentralized P2P training."""
+    inp = Input(shape=(n_input, 1))
+    x = LSTM(lstm_units, activation='tanh', return_sequences=False)(inp)
+    x = Dropout(dropout_rate)(x)
+    x = Dense(lstm_units, activation='relu')(x)
+    out = Dense(dense_units, activation='linear')(x)
+    return Model(inputs=inp, outputs=out)
+
+# === Load & Prepare Data ===
+print("Loading and preparing data for single customer (C001)...")
+
+input_csv = "C:/Users/n10852468/sampleEnergy.csv"
+df = pd.read_csv(input_csv)
+df.columns = df.columns.str.strip()
+df['StartDate'] = pd.to_datetime(df['StartDate'], errors='coerce')
+df['EndDate'] = pd.to_datetime(df['EndDate'], errors='coerce')
+df = df.dropna(subset=['RateTypeDescription','StartDate','EndDate','ProfileReadValue'])
+df = df[df['RateTypeDescription'].isin(['Solar','Generalusage'])].copy()
+
+expanded_rows = []
+for _, row in df.iterrows():
+    rng = pd.date_range(start=row['StartDate'], end=row['EndDate'], freq='30T', inclusive='left')
+    for ts in rng:
+        expanded_rows.append({
+            'datetime': ts,
+            'rate_type': row['RateTypeDescription'],
+            'value': float(row['ProfileReadValue'])
+        })
+df_expanded = pd.DataFrame(expanded_rows).sort_values('datetime')
+
+df_pivot = df_expanded.pivot_table(index='datetime', columns='rate_type', values='value', aggfunc='mean')
+for col in ['Solar','Generalusage']:
+    if col not in df_pivot.columns:
+        df_pivot[col] = 0.0
+full_index = pd.date_range(start=df_pivot.index.min(), end=df_pivot.index.max(), freq='30T')
+df_pivot = df_pivot.reindex(full_index)
+df_pivot['Generalusage'] = df_pivot['Generalusage'].ffill().bfill().fillna(0.0)
+hours = df_pivot.index.hour
+df_pivot['Solar'] = df_pivot['Solar'].where((hours >= 8) & (hours < 18), 0.0).fillna(0.0)
+df_pivot['consumption'] = df_pivot['Generalusage'] + df_pivot['Solar']
+
+df_timeseries = df_pivot[['consumption']].copy()
+df_timeseries.index.name = 'datetime'
+print(f"Data prepared: {len(df_timeseries)} records ({df_timeseries.index.min()} → {df_timeseries.index.max()})")
+
+# === STL decomposition & sequence preparation ===
+cust_data = df_timeseries.copy()
+cust_data['consumption'] = cust_data['consumption'].ffill().bfill()
+
+stl = STL(cust_data['consumption'], period=stl_period, robust=True).fit()
+resid, trend, seas = stl.resid, stl.trend, stl.seasonal
+scaler = StandardScaler()
+resid_scaled = scaler.fit_transform(resid.values.reshape(-1,1)).flatten()
+seq_count = len(resid_scaled) - n_input - dense_units + 1
+
+X = np.array([resid_scaled[i:i+n_input] for i in range(seq_count)]).reshape(seq_count, n_input, 1)
+y = np.array([resid_scaled[i+n_input:i+n_input+dense_units] for i in range(seq_count)])
+
+results = {
+    'C001': {
+        'X': X, 'y': y,
+        'trend': trend.iloc[-len(y):],
+        'seas': seas.iloc[-len(y):],
+        'actual': cust_data['consumption'].iloc[-len(y):],
+        'scaler': scaler
+    }
+}
+
+client_ids = ['C001', 'C002', 'C003']  # simulate 3 P2P clients
+print(f"Prepared {len(X)} training sequences for each simulated client.")
+
+# === Gossip-based Decentralized Training Setup ===
+def gossip_average(w1, w2):
+    """Average two clients' weights (pairwise gossip exchange)."""
+    return [(a + b) / 2.0 for a, b in zip(w1, w2)]
+
+algorithms = ["FedAvg", "FedProx", "FedDynamic", "FedSCAFFOLD"]
+client_models = {alg:{} for alg in algorithms}
+customer_times = {cid: {'train': 0.0, 'converge': 0.0} for cid in client_ids}
+metrics_history = {alg:{'R2':[], 'RMSE':[], 'MAPE':[]} for alg in algorithms}
+
+# Initialize LSTM models for each client
+for alg in algorithms:
+    for cid in client_ids:
+        params = {
+            'learning_rate': random.choice(training_param_space['learning_rate']),
+            'batch_size': random.choice(training_param_space['batch_size']),
+            'dropout_rate': random.choice(training_param_space['dropout_rate']),
+            'epochs': epochs
+        }
+        model = build_lstm_model(n_input, lstm_units, dense_units, params['dropout_rate'])
+        model.compile(optimizer=Adam(learning_rate=params['learning_rate']), loss=Huber())
+        client_models[alg][cid] = {'model': model, 'params': params}
+
+# === Decentralized Gossip-based Training ===
+global_start = time.time()
+global_convergence_start = time.time()
+
+for rnd in range(rounds):
+    print(f"\n=== Round {rnd+1}/{rounds} ===")
+    local_weights = {alg:{} for alg in algorithms}
+
+    # --- Local training ---
+    for alg in algorithms:
+        for cid in client_ids:
+            start_train = time.time()
+            data = results['C001']  # same dataset for demo
+            X_all, y_all = data['X'], data['y']
+            n_total = X_all.shape[0]
+            train_size = int(0.6 * n_total)
+            val_size = int(0.2 * n_total)
+            X_train, y_train = X_all[:train_size], y_all[:train_size]
+
+            params = client_models[alg][cid]['params']
+            model = client_models[alg][cid]['model']
+            model.fit(X_train, y_train,
+                      epochs=params['epochs'],
+                      batch_size=params['batch_size'],
+                      verbose=0)
+
+            local_weights[alg][cid] = model.get_weights()
+            end_train = time.time()
+            customer_times[cid]['train'] += (end_train - start_train)
+
+    # --- Decentralized Gossip Aggregation ---
+    for alg in algorithms:
+        peers = client_ids.copy()
+        random.shuffle(peers)
+        for i in range(0, len(peers)-1, 2):
+            c1, c2 = peers[i], peers[i+1]
+            w1, w2 = local_weights[alg][c1], local_weights[alg][c2]
+            new_w = gossip_average(w1, w2)
+            local_weights[alg][c1] = new_w
+            local_weights[alg][c2] = new_w
+
+        # Update models after gossip exchange
+        for cid in client_ids:
+            start_converge = time.time()
+            client_models[alg][cid]['model'].set_weights(local_weights[alg][cid])
+            end_converge = time.time()
+            customer_times[cid]['converge'] += (end_converge - start_converge)
+
+    # --- Evaluation ---
+    for alg in algorithms:
+        r2_list, rmse_list, mape_list = [], [], []
+        for cid in client_ids:
+            data = results['C001']
+            X_all, y_all = data['X'], data['y']
+            n_total = X_all.shape[0]
+            train_size = int(0.6 * n_total)
+            val_size = int(0.2 * n_total)
+            X_test = X_all[train_size+val_size:]
+            if X_test.shape[0] == 0:
+                continue
+
+            model = client_models[alg][cid]['model']
+            y_pred = model.predict(X_test)
+            scaler = data['scaler']
+            y_pred_rescaled = scaler.inverse_transform(y_pred.reshape(-1,1)).reshape(y_pred.shape)
+
+            trend_test = data['trend'].iloc[train_size+val_size:]
+            seas_test = data['seas'].iloc[train_size+val_size:]
+            actual_test = data['actual'].iloc[train_size+val_size:]
+
+            final_pred = y_pred_rescaled + np.tile(trend_test.values.reshape(-1,1),(1,dense_units)) \
+                         + np.tile(seas_test.values.reshape(-1,1),(1,dense_units))
+
+            rmse_list.append(np.sqrt(mean_squared_error(actual_test, final_pred[:,0])))
+            mape_list.append(np.mean(np.abs((actual_test.values - final_pred[:,0]) / np.maximum(actual_test.values,1e-6)))*100)
+            r2_list.append(r2_score(actual_test.values, final_pred[:,0]))
+
+        if r2_list:
+            metrics_history[alg]['R2'].append(np.mean(r2_list))
+            metrics_history[alg]['RMSE'].append(np.mean(rmse_list))
+            metrics_history[alg]['MAPE'].append(np.mean(mape_list))
+
+global_convergence_end = time.time()
+
+# === Timing Output ===
+print(f"\nTotal Global Training Time: {time.time()-global_start:.2f}s")
+print(f"Global Gossip Time: {global_convergence_end-global_convergence_start:.2f}s")
+for cid, tvals in customer_times.items():
+    print(f"Client {cid}: Training = {tvals['train']:.2f}s, Gossip = {tvals['converge']:.2f}s")
+
+# === Metrics Plots ===
+fig, (ax1, ax2, ax3) = plt.subplots(1,3, figsize=(18,6))
+rounds_range = range(1, rounds+1)
+for alg in algorithms:
+    ax1.plot(rounds_range, metrics_history[alg]['R2'], marker='o', label=alg)
+    ax2.plot(rounds_range, metrics_history[alg]['RMSE'], marker='o', label=alg)
+    ax3.plot(rounds_range, metrics_history[alg]['MAPE'], marker='o', label=alg)
+ax1.set_title('$R^2$ per Round'); ax1.legend(); ax1.grid(True)
+ax2.set_title('RMSE per Round'); ax2.legend(); ax2.grid(True)
+ax3.set_title('MAPE per Round'); ax3.legend(); ax3.grid(True)
+plt.show()
+
+# === Final Summary ===
+summary = []
+for alg in algorithms:
+    r2_last = metrics_history[alg]['R2'][-1] if metrics_history[alg]['R2'] else None
+    rmse_last = metrics_history[alg]['RMSE'][-1] if metrics_history[alg]['RMSE'] else None
+    mape_last = metrics_history[alg]['MAPE'][-1] if metrics_history[alg]['MAPE'] else None
+    summary.append([alg, r2_last, rmse_last, mape_last])
+summary_df = pd.DataFrame(summary, columns=["Algorithm", "R2", "RMSE", "MAPE"])
+print("\nFinal Comparison (last round):")
+print(summary_df)
+
+
