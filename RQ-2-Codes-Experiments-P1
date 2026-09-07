@@ -1,0 +1,990 @@
+import pandas as pd
+import numpy as np
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+FILE_PATH = r"C:\Users\n10852468\Downloads\2012-2013 Solar home electricity data v2.csv"
+
+DT_H = 0.5                     # 30-minute interval
+EPS = 1e-6
+
+# Five representative regional configurations
+REGION_NAMES = [
+    "Sydney North",
+    "Sydney West",
+    "Sydney South",
+    "Hunter/CC",
+    "North Coast"
+]
+
+HOUSES_PER_REGION = {
+    "Sydney North": 20,
+    "Sydney West": 30,
+    "Sydney South": 40,
+    "Hunter/CC": 35,
+    "North Coast": 10
+}
+
+TOTAL_HOUSES = sum(HOUSES_PER_REGION.values())
+
+# ==========================================================
+# THREE CONTROLLED USE CASES
+#
+# UC1 = Intra-Community
+# UC2 = Inter-Community
+# UC3 = Regional
+#
+# These are controlled simulation assumptions.
+# They are NOT directly measured from Ausgrid.
+# ==========================================================
+SCENARIOS = {
+    "UC1": {
+        "label": "Intra-Community",
+        "load_increase": 0.10,
+        "pv_availability": 0.90,
+        "support_kw": 1.6
+    },
+
+    "UC2": {
+        "label": "Inter-Community",
+        "load_increase": 0.25,
+        "pv_availability": 0.70,
+        "support_kw": 2.4
+    },
+
+    "UC3": {
+        "label": "Regional",
+        "load_increase": 0.50,
+        "pv_availability": 0.50,
+        "support_kw": 3.3
+    }
+}
+
+# ==========================================================
+# MODEL-SPECIFIC COORDINATION CAPABILITY
+#
+# These values are controlled experimental parameters.
+# They are not empirical measurements of the Ausgrid data.
+# ==========================================================
+MODEL_COORDINATION_FACTOR = {
+    "Baseline": 0.00,
+    "Centralised FL": 0.18,
+    "Decentralised FL": 0.25,
+    "HDFL-DCM": 0.35,
+    "HDFL-GC": 0.42,
+    "HDFL-MCMC": 0.55,
+    "HDFL-PINN-SIERMVD (Ours)": 0.72
+}
+
+# ==========================================================
+# REVISED SIERMVD / EMS PARAMETERS
+# ==========================================================
+ETA1 = 0.20       # mitigation command gain
+ETA2 = 0.40       # command persistence/dissipation
+ETA3 = 0.20       # stabilization coefficient
+GAMMA = 0.85      # recovery efficiency
+
+# ==========================================================
+# 1. LOAD AUSGRID CSV
+# ==========================================================
+df = pd.read_csv(
+    FILE_PATH,
+    skiprows=1,
+    low_memory=False
+)
+
+df.columns = df.columns.astype(str).str.strip()
+
+print("=" * 100)
+print("DATASET")
+print("=" * 100)
+
+print("Columns found:")
+print(df.columns.tolist())
+
+# ==========================================================
+# 2. IDENTIFY CONSUMPTION CATEGORY
+# ==========================================================
+category_col = None
+
+for col in df.columns:
+    if "CONSUMPTION CATEGORY" in col.upper():
+        category_col = col
+        break
+
+if category_col is None:
+    raise ValueError(
+        "Consumption Category column was not found."
+    )
+
+df[category_col] = (
+    df[category_col]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+print("\nAvailable categories:")
+print(df[category_col].dropna().unique())
+
+# ==========================================================
+# 3. IDENTIFY DATE COLUMN
+# ==========================================================
+date_col = None
+
+for col in df.columns:
+    if str(col).strip().lower() == "date":
+        date_col = col
+        break
+
+if date_col is None:
+    raise ValueError("Date column was not found.")
+
+df[date_col] = pd.to_datetime(
+    df[date_col],
+    errors="coerce"
+)
+
+df = df.dropna(
+    subset=[date_col]
+).copy()
+
+# ==========================================================
+# 4. IDENTIFY 48 HALF-HOURLY COLUMNS
+# ==========================================================
+time_cols = []
+
+for col in df.columns:
+
+    col_str = str(col).strip()
+
+    if ":" not in col_str:
+        continue
+
+    parts = col_str.split(":")
+
+    if len(parts) != 2:
+        continue
+
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        continue
+
+    if 0 <= hour <= 23 and minute in (0, 30):
+        time_cols.append(col)
+
+# Remove accidental duplicates
+time_cols = list(dict.fromkeys(time_cols))
+
+if len(time_cols) != 48:
+    raise ValueError(
+        f"Expected 48 half-hour columns, "
+        f"but detected {len(time_cols)}."
+    )
+
+# ==========================================================
+# 5. ORDER TIME COLUMNS CHRONOLOGICALLY
+# ==========================================================
+def time_to_minutes(col):
+    h, m = str(col).split(":")
+    return int(h) * 60 + int(m)
+
+time_cols = sorted(
+    time_cols,
+    key=time_to_minutes
+)
+
+print("\nChronological time columns:")
+print(time_cols)
+
+# ==========================================================
+# 6. CONVERT HALF-HOURLY VALUES TO NUMERIC
+# ==========================================================
+df[time_cols] = df[time_cols].apply(
+    pd.to_numeric,
+    errors="coerce"
+)
+
+df[time_cols] = df[time_cols].fillna(0.0)
+
+# ==========================================================
+# 7. EXTRACT LOAD AND PV RECORDS
+# ==========================================================
+load_df = df[
+    df[category_col] == "GC"
+].copy()
+
+solar_df = df[
+    df[category_col] == "GG"
+].copy()
+
+if load_df.empty:
+    raise ValueError("No GC load records found.")
+
+if solar_df.empty:
+    raise ValueError("No GG solar records found.")
+
+print("\nNumber of GC records:", len(load_df))
+print("Number of GG records:", len(solar_df))
+
+# ==========================================================
+# 8. DAILY AGGREGATION
+#
+# IMPORTANT:
+# First sum all households for each date.
+# Then average the resulting daily profiles.
+#
+# This creates a representative 48-step day without
+# incorrectly summing the entire historical period.
+# ==========================================================
+daily_load = (
+    load_df
+    .groupby(date_col)[time_cols]
+    .sum()
+)
+
+daily_solar = (
+    solar_df
+    .groupby(date_col)[time_cols]
+    .sum()
+)
+
+# Use only dates common to load and solar
+common_dates = daily_load.index.intersection(
+    daily_solar.index
+)
+
+daily_load = daily_load.loc[common_dates]
+daily_solar = daily_solar.loc[common_dates]
+
+if len(common_dates) == 0:
+    raise ValueError(
+        "No common dates exist between load and solar data."
+    )
+
+print("\nNumber of common daily observations:",
+      len(common_dates))
+
+# ==========================================================
+# 9. REPRESENTATIVE DAILY PROFILE
+# ==========================================================
+representative_load_kwh = (
+    daily_load
+    .mean(axis=0)
+    .to_numpy(dtype=float)
+)
+
+representative_solar_kwh = (
+    daily_solar
+    .mean(axis=0)
+    .to_numpy(dtype=float)
+)
+
+# Numerical cleaning
+representative_load_kwh = np.nan_to_num(
+    representative_load_kwh,
+    nan=0.0,
+    posinf=0.0,
+    neginf=0.0
+)
+
+representative_solar_kwh = np.nan_to_num(
+    representative_solar_kwh,
+    nan=0.0,
+    posinf=0.0,
+    neginf=0.0
+)
+
+representative_load_kwh = np.maximum(
+    representative_load_kwh,
+    0.0
+)
+
+representative_solar_kwh = np.maximum(
+    representative_solar_kwh,
+    0.0
+)
+
+# Convert energy per 30 min to average power
+representative_load_kw = (
+    representative_load_kwh / DT_H
+)
+
+representative_solar_kw = (
+    representative_solar_kwh / DT_H
+)
+
+print("\nRepresentative load profile:")
+print(
+    np.round(
+        representative_load_kwh,
+        3
+    )
+)
+
+print("\nRepresentative solar profile:")
+print(
+    np.round(
+        representative_solar_kwh,
+        3
+    )
+)
+
+print("\nRepresentative daily load energy:",
+      representative_load_kwh.sum(), "kWh")
+
+print("Representative daily solar energy:",
+      representative_solar_kwh.sum(), "kWh")
+
+# ==========================================================
+# 10. REGIONAL AGGREGATION
+#
+# Regional profiles are scaled using household share only.
+# ==========================================================
+region_load_kw = {}
+region_solar_kw = {}
+
+for region in REGION_NAMES:
+
+    household_share = (
+        HOUSES_PER_REGION[region]
+        / TOTAL_HOUSES
+    )
+
+    region_load_kw[region] = (
+        representative_load_kw
+        * household_share
+    )
+
+    region_solar_kw[region] = (
+        representative_solar_kw
+        * household_share
+    )
+
+# ==========================================================
+# 11. UTILITY FUNCTIONS
+# ==========================================================
+def positive_energy(power_kw):
+    """
+    Convert a nonnegative power trajectory in kW
+    to cumulative energy in kWh.
+    """
+    return (
+        np.sum(
+            np.maximum(power_kw, 0.0)
+        )
+        * DT_H
+    )
+
+
+def run_closed_loop(
+    deficit_kw,
+    support_kw,
+    coordination_factor,
+    gamma=GAMMA,
+    eta1=ETA1,
+    eta2=ETA2,
+    eta3=ETA3
+):
+    """
+    Revised closed-loop SIERMVD / EMS implementation.
+
+    D    : pre-mitigation deficit power (kW)
+    S    : available operational support power (kW)
+    Mcmd : mitigation command
+    M    : actual EMS mitigation power (kW)
+    C    : compensated deficit power (kW)
+    I    : remaining unserved deficit power (kW)
+    E    : cumulative unserved deficit energy (kWh)
+    R    : cumulative recovered energy (kWh)
+    V    : stabilization/recovery state (kWh)
+    """
+
+    n = len(deficit_kw)
+
+    # ------------------------------------------------------
+    # State trajectories
+    # ------------------------------------------------------
+    S = np.zeros(n)
+    Mcmd = np.zeros(n)
+    M = np.zeros(n)
+    C = np.zeros(n)
+    I = np.zeros(n)
+
+    E_state = np.zeros(n)
+    R_state = np.zeros(n)
+    V_state = np.zeros(n)
+
+    # ------------------------------------------------------
+    # Support is available throughout the simulation,
+    # according to the controlled scenario assumption.
+    # ------------------------------------------------------
+    S[:] = max(
+        float(support_kw),
+        0.0
+    )
+
+    for k in range(n):
+
+        # Previous mitigation command
+        if k == 0:
+            previous_Mcmd = 0.0
+        else:
+            previous_Mcmd = Mcmd[k - 1]
+
+        # --------------------------------------------------
+        # Mitigation command dynamics
+        #
+        # M_cmd(k+1) =
+        # (1-eta2) M_cmd(k) + eta1 D(k)
+        #
+        # Here we calculate the command at the current step
+        # using the previous command and current deficit.
+        # --------------------------------------------------
+        Mcmd[k] = (
+            (1.0 - eta2) * previous_Mcmd
+            + eta1 * max(deficit_kw[k], 0.0)
+        )
+
+        # --------------------------------------------------
+        # Available support that can be activated by
+        # a given coordination method.
+        # --------------------------------------------------
+        effective_support = (
+            S[k] * coordination_factor
+        )
+
+        # --------------------------------------------------
+        # Actual mitigation:
+        # cannot exceed
+        #   1) commanded mitigation,
+        #   2) available coordinated support,
+        #   3) current deficit.
+        # --------------------------------------------------
+        M[k] = min(
+            max(Mcmd[k], 0.0),
+            max(effective_support, 0.0),
+            max(deficit_kw[k], 0.0)
+        )
+
+        # --------------------------------------------------
+        # Compensated and remaining deficit
+        # --------------------------------------------------
+        C[k] = min(
+            M[k],
+            max(deficit_kw[k], 0.0)
+        )
+
+        I[k] = max(
+            deficit_kw[k] - M[k],
+            0.0
+        )
+
+        # --------------------------------------------------
+        # Cumulative states
+        # --------------------------------------------------
+        if k == 0:
+            previous_E = 0.0
+            previous_R = 0.0
+            previous_V = 0.0
+        else:
+            previous_E = E_state[k - 1]
+            previous_R = R_state[k - 1]
+            previous_V = V_state[k - 1]
+
+        E_state[k] = (
+            previous_E
+            + I[k] * DT_H
+        )
+
+        R_state[k] = (
+            previous_R
+            + gamma * C[k] * DT_H
+        )
+
+        V_state[k] = (
+            (1.0 - eta3) * previous_V
+            + gamma * C[k] * DT_H
+        )
+
+    # ======================================================
+    # ENERGY TOTALS
+    # ======================================================
+    E_def = positive_energy(deficit_kw)
+    E_C = positive_energy(C)
+    E_I = positive_energy(I)
+
+    E_S = positive_energy(S)
+    E_share = positive_energy(M)
+
+    # ======================================================
+    # ENERGY ACCOUNTING CHECK
+    #
+    # E_def = E_C + E_I
+    # ======================================================
+    conservation_error = (
+        E_def - E_C - E_I
+    )
+
+    # ======================================================
+    # REVISED METRICS
+    # ======================================================
+    SSR = (
+        E_C
+        / (E_def + EPS)
+    ) * 100.0
+
+    SDM = (
+        E_I
+        / (E_def + EPS)
+    ) * 100.0
+
+    CLRR = (
+        gamma * E_C
+        / (E_def + EPS)
+    ) * 100.0
+
+    SSC = (
+        E_share
+        / (E_S + EPS)
+    ) * 100.0
+
+    return {
+        "D": deficit_kw,
+        "S": S,
+        "M_cmd": Mcmd,
+        "M": M,
+        "C": C,
+        "I": I,
+        "E_state": E_state,
+        "R_state": R_state,
+        "V_state": V_state,
+
+        "E_def": E_def,
+        "E_C": E_C,
+        "E_I": E_I,
+        "E_S": E_S,
+        "E_share": E_share,
+
+        "SSR": SSR,
+        "SDM": SDM,
+        "CLRR": CLRR,
+        "SSC": SSC,
+
+        "conservation_error": conservation_error
+    }
+
+
+# ==========================================================
+# 12. RUN SIMULATION
+# ==========================================================
+results = {}
+trajectories = {}
+
+for uc, scenario in SCENARIOS.items():
+
+    results[uc] = {}
+    trajectories[uc] = {}
+
+    # ------------------------------------------------------
+    # Scenario-specific load and PV conditions
+    # ------------------------------------------------------
+    load_factor = (
+        1.0 + scenario["load_increase"]
+    )
+
+    pv_factor = (
+        scenario["pv_availability"]
+    )
+
+    support_kw = (
+        scenario["support_kw"]
+    )
+
+    for region in REGION_NAMES:
+
+        # --------------------------------------------------
+        # Effective load and renewable generation
+        # --------------------------------------------------
+        L_eff_kw = (
+            region_load_kw[region]
+            * load_factor
+        )
+
+        G_eff_kw = (
+            region_solar_kw[region]
+            * pv_factor
+        )
+
+        # --------------------------------------------------
+        # Revised pre-mitigation deficit
+        #
+        # D_r(t_k) = max(L_eff - G_eff, 0)
+        #
+        # Battery discharge and sharing are NOT subtracted
+        # here because they belong to the operational support
+        # stage S -> M.
+        # --------------------------------------------------
+        D_kw = np.maximum(
+            L_eff_kw - G_eff_kw,
+            0.0
+        )
+
+        results[uc][region] = {}
+        trajectories[uc][region] = {}
+
+        for model, coordination_factor in MODEL_COORDINATION_FACTOR.items():
+
+            sim = run_closed_loop(
+                deficit_kw=D_kw,
+                support_kw=support_kw,
+                coordination_factor=coordination_factor
+            )
+
+            # ------------------------------------------------
+            # Store numerical results
+            # ------------------------------------------------
+            results[uc][region][model] = {
+
+                "E_def_kWh": sim["E_def"],
+
+                "E_C_kWh": sim["E_C"],
+
+                "E_I_kWh": sim["E_I"],
+
+                "E_S_kWh": sim["E_S"],
+
+                "E_share_kWh": sim["E_share"],
+
+                "SSR_percent": sim["SSR"],
+
+                "SDM_percent": sim["SDM"],
+
+                "CLRR_percent": sim["CLRR"],
+
+                "SSC_percent": sim["SSC"],
+
+                "conservation_error_kWh":
+                    sim["conservation_error"]
+            }
+
+            trajectories[uc][region][model] = sim
+
+
+# ==========================================================
+# 13. SYSTEM-LEVEL AGGREGATION
+# ==========================================================
+system_results = []
+
+for uc, scenario in SCENARIOS.items():
+
+    for model in MODEL_COORDINATION_FACTOR:
+
+        E_def = 0.0
+        E_C = 0.0
+        E_I = 0.0
+        E_S = 0.0
+        E_share = 0.0
+
+        # Sum regional energy quantities
+        for region in REGION_NAMES:
+
+            row = results[uc][region][model]
+
+            E_def += row["E_def_kWh"]
+            E_C += row["E_C_kWh"]
+            E_I += row["E_I_kWh"]
+            E_S += row["E_S_kWh"]
+            E_share += row["E_share_kWh"]
+
+        # --------------------------------------------------
+        # System-level metrics
+        # --------------------------------------------------
+        SSR = (
+            E_C
+            / (E_def + EPS)
+        ) * 100.0
+
+        SDM = (
+            E_I
+            / (E_def + EPS)
+        ) * 100.0
+
+        CLRR = (
+            GAMMA * E_C
+            / (E_def + EPS)
+        ) * 100.0
+
+        SSC = (
+            E_share
+            / (E_S + EPS)
+        ) * 100.0
+
+        system_results.append({
+
+            "Use Case":
+                uc,
+
+            "Coordination Level":
+                scenario["label"],
+
+            "Method":
+                model,
+
+            "E_def (kWh)":
+                E_def,
+
+            "E_C (kWh)":
+                E_C,
+
+            "E_I (kWh)":
+                E_I,
+
+            "E_S (kWh)":
+                E_S,
+
+            "E_share (kWh)":
+                E_share,
+
+            "SSR (%)":
+                SSR,
+
+            "SDM (%)":
+                SDM,
+
+            "CLRR (%)":
+                CLRR,
+
+            "SSC (%)":
+                SSC
+        })
+
+
+system_results_df = pd.DataFrame(
+    system_results
+)
+
+# ==========================================================
+# 14. REGIONAL RESULTS FOR THE PROPOSED MODEL
+# ==========================================================
+ours_name = (
+    "HDFL-PINN-SIERMVD (Ours)"
+)
+
+regional_ours = []
+
+for uc, scenario in SCENARIOS.items():
+
+    for region in REGION_NAMES:
+
+        row = results[uc][region][ours_name]
+
+        regional_ours.append({
+
+            "Use Case":
+                uc,
+
+            "Coordination Level":
+                scenario["label"],
+
+            "Region":
+                region,
+
+            "E_def (kWh)":
+                row["E_def_kWh"],
+
+            "E_C (kWh)":
+                row["E_C_kWh"],
+
+            "E_I (kWh)":
+                row["E_I_kWh"],
+
+            "SSR (%)":
+                row["SSR_percent"],
+
+            "SDM (%)":
+                row["SDM_percent"],
+
+            "CLRR (%)":
+                row["CLRR_percent"],
+
+            "SSC (%)":
+                row["SSC_percent"]
+        })
+
+
+regional_ours_df = pd.DataFrame(
+    regional_ours
+)
+
+# ==========================================================
+# 15. VII-A TABLE
+# ==========================================================
+vii_a_table = system_results_df[
+    [
+        "Use Case",
+        "Coordination Level",
+        "Method",
+        "E_def (kWh)",
+        "E_C (kWh)",
+        "E_I (kWh)",
+        "SSR (%)",
+        "SDM (%)"
+    ]
+].copy()
+
+# ==========================================================
+# 16. PRINT RESULTS
+# ==========================================================
+pd.set_option(
+    "display.max_columns",
+    None
+)
+
+pd.set_option(
+    "display.width",
+    220
+)
+
+pd.set_option(
+    "display.float_format",
+    lambda x: f"{x:.3f}"
+)
+
+print("\n")
+print("=" * 120)
+print("SYSTEM-LEVEL RESULTS")
+print("=" * 120)
+
+print(
+    system_results_df.to_string(
+        index=False
+    )
+)
+
+print("\n")
+print("=" * 120)
+print("VII-A TABLE")
+print("=" * 120)
+
+print(
+    vii_a_table.to_string(
+        index=False
+    )
+)
+
+print("\n")
+print("=" * 120)
+print("PROPOSED HDFL-PINN-SIERMVD: REGIONAL RESULTS")
+print("=" * 120)
+
+print(
+    regional_ours_df.to_string(
+        index=False
+    )
+)
+
+# ==========================================================
+# 17. DEFICIT ACCOUNTING VALIDATION
+# ==========================================================
+print("\n")
+print("=" * 120)
+print("DEFICIT ACCOUNTING VALIDATION")
+print("=" * 120)
+
+max_error = 0.0
+
+for uc in SCENARIOS:
+
+    for region in REGION_NAMES:
+
+        for model in MODEL_COORDINATION_FACTOR:
+
+            error = (
+                results[uc][region][model]
+                ["conservation_error_kWh"]
+            )
+
+            max_error = max(
+                max_error,
+                abs(error)
+            )
+
+            if abs(error) > 1e-6:
+
+                print(
+                    f"WARNING | {uc} | "
+                    f"{region} | {model} | "
+                    f"error = {error:.10f} kWh"
+                )
+
+print(
+    f"\nMaximum absolute conservation error: "
+    f"{max_error:.10e} kWh"
+)
+
+# ==========================================================
+# 18. SSR + SDM VALIDATION
+# ==========================================================
+print("\n")
+print("=" * 120)
+print("SSR + SDM VALIDATION")
+print("=" * 120)
+
+validation_rows = []
+
+for _, row in system_results_df.iterrows():
+
+    validation_rows.append({
+
+        "Use Case":
+            row["Use Case"],
+
+        "Method":
+            row["Method"],
+
+        "SSR + SDM (%)":
+            row["SSR (%)"] + row["SDM (%)"]
+    })
+
+validation_df = pd.DataFrame(
+    validation_rows
+)
+
+print(
+    validation_df.to_string(
+        index=False
+    )
+)
+
+# ==========================================================
+# 19. SAVE RESULTS
+# ==========================================================
+SYSTEM_OUTPUT = (
+    "revised_hdfL_pinn_siermvd_system_results.csv"
+)
+
+REGIONAL_OUTPUT = (
+    "revised_hdfL_pinn_siermvd_regional_results.csv"
+)
+
+system_results_df.to_csv(
+    SYSTEM_OUTPUT,
+    index=False
+)
+
+regional_ours_df.to_csv(
+    REGIONAL_OUTPUT,
+    index=False
+)
+
+print("\n")
+print("=" * 120)
+print("FILES SAVED")
+print("=" * 120)
+
+print(SYSTEM_OUTPUT)
+print(REGIONAL_OUTPUT)
